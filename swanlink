@@ -13,7 +13,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 REPO="${SWANLINK_REPO:-syblock/swanlink}"
 BRANCH="${SWANLINK_BRANCH:-main}"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
@@ -135,6 +135,8 @@ build_payload() {
 set -e
 # Refuse to run on a box that's actively serving Libreswan VPN
 if pgrep -x pluto >/dev/null; then echo "ABORT: Libreswan (pluto) is running here. Is this a VPN server?"; exit 1; fi
+# An nginx relay holds UDP 500/4500, which strongSwan needs
+if grep -qsx 'RELAY_MODE=nginx' /etc/swanlink/relay.env; then echo "ABORT: this host is an nginx relay. Switch it first: swanlink relay <vpn-server> --iptables"; exit 1; fi
 # Neutralize leftover (stopped) Libreswan so 'ipsec' means strongSwan
 if [ -x /usr/local/sbin/ipsec ] && /usr/local/sbin/ipsec --version 2>/dev/null | grep -qi libreswan; then
   systemctl disable --now ipsec >/dev/null 2>&1 || true
@@ -541,6 +543,9 @@ cmd_down() {
   if systemctl is-enabled strongswan-starter >/dev/null 2>&1; then
     hint "It will reconnect on reboot. Use 'swanlink disable' to stop that."
   fi
+  if is_relay; then
+    hint "The relay on this host keeps forwarding."
+  fi
 }
 
 cmd_enable() {
@@ -668,7 +673,7 @@ T=$target
 C="-m comment --comment swanlink-relay"
 P="-p udp -m multiport"
 rules() {
-  iptables -t nat \$1 PREROUTING \$P --dports 500,4500 -m addrtype --dst-type LOCAL \$C -j DNAT --to-destination \$T
+  iptables -t nat \$1 PREROUTING \$P --dports 500,4500 ! -s \$T -m addrtype --dst-type LOCAL \$C -j DNAT --to-destination \$T
   iptables -t nat \$1 POSTROUTING \$P --dports 500,4500 -d \$T \$C -j MASQUERADE
   iptables \$1 FORWARD \$P --dports 500,4500 -d \$T \$C -j ACCEPT
   iptables \$1 FORWARD \$P --sports 500,4500 -s \$T \$C -j ACCEPT
@@ -730,8 +735,14 @@ relay_remove() {
   ok "Relay removed."
 }
 
+# Prints the first process other than nginx that holds UDP 500 or 4500.
+ike_port_owner() {
+  ss -Hlunp 2>/dev/null | awk '$4 ~ /:(500|4500)$/' \
+    | grep -oP 'users:\(\("\K[^"]+' | grep -vx nginx | head -n1 || true
+}
+
 cmd_relay() {
-  local mode=nginx target="" ip
+  local mode="" target="" ip owner
   case ${1:-} in
     status) need_root relay; is_relay || die "No swanlink relay on this host."; relay_status; return 0 ;;
     remove) need_root relay; relay_remove; return 0 ;;
@@ -748,7 +759,15 @@ cmd_relay() {
   done
   need_root relay
   is_server && die "This host is the VPN server; a relay must be a different machine."
-  client_conn >/dev/null && die "This host is a VPN client; a relay must be a different machine."
+
+  # A local strongSwan client holds UDP 500/4500, so nginx can't listen there.
+  # DNAT rewrites packets before they reach any socket, so both can coexist.
+  if client_conn >/dev/null; then
+    [ "$mode" = nginx ] && die "This host is a VPN client; its strongSwan holds UDP 500/4500. Use --iptables."
+    [ -z "$mode" ] && info "This host is also a VPN client; using --iptables."
+    mode=iptables
+  fi
+  mode=${mode:-nginx}
 
   ip=$(resolve_ipv4 "$target")
   [ -n "$ip" ] || die "Could not resolve '$target' to an IPv4 address."
@@ -756,6 +775,11 @@ cmd_relay() {
   if is_relay; then
     info "Replacing existing relay config"
     relay_remove >/dev/null 2>&1
+  fi
+
+  if [ "$mode" = nginx ]; then
+    owner=$(ike_port_owner)
+    [ -z "$owner" ] || die "UDP 500/4500 is already used by '$owner'. Stop it, or use --iptables."
   fi
 
   info "Setting up $mode relay: UDP 500, 4500 -> $ip"
@@ -777,10 +801,15 @@ cmd_status() {
   need_root status
   if is_server; then
     server_status
-  elif is_relay; then
-    relay_status
-  elif CLIENT_CONN=$(client_conn); then
-    client_status
+  elif is_relay || client_conn >/dev/null; then
+    # A host can be both a relay and a client
+    if CLIENT_CONN=$(client_conn); then
+      client_status
+      is_relay && echo
+    fi
+    if is_relay; then
+      relay_status
+    fi
   else
     echo "Nothing set up on this host yet."
     hint "VPN server:  sudo swanlink setup"
@@ -883,6 +912,15 @@ M
    3) Status
    4) Remove tunnel
 M
+      if is_relay; then
+        cat >&2 << 'M'
+   5) Remove relay
+M
+      else
+        cat >&2 << 'M'
+   5) Also set up this machine as a relay
+M
+      fi
     elif is_relay; then
       cat >&2 << 'M'
   Relay
@@ -917,6 +955,7 @@ M
         2) run cmd_down ;;
         3) run cmd_status ;;
         4) run cmd_remove ;;
+        5) if is_relay; then run cmd_relay remove; else run cmd_relay "$(ask_relay_target)"; fi ;;
         u) run cmd_update ;;
         q|Q|'') return 0 ;;
       esac
@@ -963,9 +1002,10 @@ Client commands (run on a machine connected with a swanlink command):
   enable | disable     Turn autostart on boot on / off
   remove [-y]          Remove the tunnel config from this machine
 
-Relay commands (run on a separate box that forwards to the VPN server):
+Relay commands (run on a box that forwards to the VPN server; may also be a client):
   relay <vpn-server> [--iptables]
-                       Forward UDP 500/4500 to the VPN server (nginx by default)
+                       Forward UDP 500/4500 to the VPN server (nginx by default,
+                       iptables if this host is also a client)
   relay status         Show relay status
   relay remove         Remove the relay
 
@@ -1018,6 +1058,10 @@ forwarded to the VPN server. Then create clients with --via <this-host-ip>.
 
   --nginx      Use nginx stream proxy (default; installs nginx if missing)
   --iptables   Use kernel DNAT instead (lighter; no nginx needed)
+
+If this host is also a swanlink client, --iptables is used: strongSwan holds
+UDP 500/4500, so nginx can't listen there. The relay keeps working while the
+local tunnel is down.
 EOF
 }
 

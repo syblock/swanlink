@@ -104,7 +104,7 @@ sudo ipsec up swanlink
 
 | Command | What it does |
 |---|---|
-| `swanlink relay <vpn-server> [--iptables]` | Forward UDP 500 and 4500 to the VPN server. Uses nginx by default |
+| `swanlink relay <vpn-server> [--iptables]` | Forward UDP 500 and 4500 to the VPN server. Uses nginx by default, or iptables if this host is also a client |
 | `swanlink relay status` | Show the relay's mode, target and listening ports |
 | `swanlink relay remove` | Remove the relay |
 
@@ -125,13 +125,15 @@ Clients can connect to a relay instead of the VPN server's IP. The relay only fo
 client ──UDP 500/4500──▶ relay (198.51.100.7) ──▶ VPN server (203.0.113.10) ──▶ internet
 ```
 
-**1. On the relay box** (any Debian or Ubuntu machine that is not the VPN server):
+**1. On the relay box** (any Debian or Ubuntu machine that is not the VPN server, client or not):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/syblock/swanlink/main/install.sh | sudo bash -s -- relay 203.0.113.10
 ```
 
 This installs nginx with its `stream` module and forwards both ports. Open UDP 500 and 4500 on the relay's firewall. To use kernel forwarding instead of nginx, add `--iptables`. It's lighter, and a systemd unit (`swanlink-relay`) restores the rules on boot.
+
+The relay box can also be a swanlink client. Its strongSwan holds UDP 500 and 4500, so nginx can't listen there, and `relay` switches to `--iptables` on its own. The relay runs in its own unit, so it keeps forwarding while the local tunnel is down. The reverse order needs `--iptables` too: the client command refuses to run on an nginx relay.
 
 If your nginx already has a `stream {}` block, swanlink stops and asks you to add `include /etc/nginx/swanlink/*.conf;` inside it, because nginx allows only one `stream` block.
 

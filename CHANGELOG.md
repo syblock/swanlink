@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 — 2026-10-24
+
+- A swanlink client can now also be a relay. `relay` switches to `--iptables` on a client, because strongSwan holds UDP 500/4500. The relay keeps forwarding while the local tunnel is down.
+- `relay` in nginx mode refuses to start when another process (for example charon) holds UDP 500/4500, instead of leaving nginx unable to listen.
+- iptables relay: the DNAT rule skips packets coming from the VPN server, so the server's packets to a client running on the relay box are never sent back to the server.
+- The client command refuses to run on an nginx relay.
+- `status` shows both the client and the relay on a host that is both, and the client menu can add or remove a relay.
+
 ## 1.0.1 — 2026-10-23
 
 - Fix shellcheck SC2015 warnings that failed CI: the certificate export check and the nginx reload during relay removal now use explicit `if` blocks. No behavior change.
