@@ -1,0 +1,1056 @@
+#!/usr/bin/env bash
+#
+# swanlink - IKEv2 VPN server setup + one-line client provisioning.
+#
+# Server side: installs an IPsec/IKEv2 VPN (hwdsl2/setup-ipsec-vpn, Libreswan)
+#              and generates a single copy-paste command per client.
+# Client side: that command turns any Debian/Ubuntu box into a strongSwan
+#              client that routes all traffic (host + Docker) through the VPN.
+#              `swanlink up|down|status|remove` manage the tunnel afterwards.
+#
+# https://github.com/syblock/swanlink
+# SPDX-License-Identifier: MIT
+
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+REPO="${SWANLINK_REPO:-syblock/swanlink}"
+BRANCH="${SWANLINK_BRANCH:-main}"
+RAW_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+
+VPNSETUP_URL="https://get.vpnsetup.net"
+VPNUNINSTALL_URL="https://get.vpnsetup.net/unst"
+
+DB="sql:/etc/ipsec.d"
+IKEV2_CONF="/etc/ipsec.d/ikev2.conf"
+STATE_DIR="/etc/swanlink"
+REVOKED_FILE="$STATE_DIR/revoked"
+
+# Name of the strongSwan connection created on clients. Older installs of the
+# original script used "cgvpn"; client commands detect either.
+CONN="swanlink"
+LEGACY_CONNS=(cgvpn)
+STRONGSWAN_IPSEC="/usr/sbin/ipsec"
+
+# ---------------------------------------------------------------------------
+# Output helpers (all human messages go to stderr, so stdout stays clean)
+# ---------------------------------------------------------------------------
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m'
+  C_RED=$'\e[31m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_CYAN=$'\e[36m'
+else
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+fi
+
+info() { printf '%s==>%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2; }
+ok()   { printf '%s ✓%s  %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn() { printf '%s !%s  %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s ✗  %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+hint() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RESET" >&2; }
+
+TMP=""
+cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; return 0; }
+mk_tmp() { TMP=$(mktemp -d); trap cleanup EXIT; }
+
+need_root() {
+  [ "$(id -u)" -eq 0 ] || die "This command needs root. Try: sudo swanlink $*"
+}
+
+need_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "Required command not found: $c"
+  done
+}
+
+confirm() {
+  local prompt=$1 reply
+  [ -t 0 ] || die "Confirmation required; re-run with -y to skip the prompt."
+  read -rp "$prompt [y/N] " reply
+  [[ $reply =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+fetch() {
+  local url=$1 out=$2
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 -o "$out" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$out" "$url"
+  else
+    die "Need curl or wget to download $url"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Server helpers
+# ---------------------------------------------------------------------------
+
+is_server() { [ -f "$IKEV2_CONF" ]; }
+
+require_server() {
+  is_server || die "No IKEv2 VPN server found on this host. Run: sudo swanlink setup"
+  need_cmd certutil pk12util openssl gzip base64
+}
+
+ikev2_bin() {
+  if command -v ikev2.sh >/dev/null 2>&1; then
+    command -v ikev2.sh
+  elif [ -x /opt/src/ikev2.sh ]; then
+    echo /opt/src/ikev2.sh
+  else
+    die "ikev2.sh helper not found (expected in PATH or /opt/src/ikev2.sh)"
+  fi
+}
+
+valid_name() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] \
+    || die "Invalid client name '$1' (use letters, digits, '-' and '_')"
+}
+
+client_exists() { certutil -L -d "$DB" -n "$1" >/dev/null 2>&1; }
+
+is_revoked() { [ -f "$REVOKED_FILE" ] && grep -qxF "$1" "$REVOKED_FILE"; }
+
+server_id() {
+  local id
+  id=$(grep -m1 -oP '^\s*leftid=@?\K\S+' "$IKEV2_CONF" 2>/dev/null || true)
+  [ -z "$id" ] && id=$(curl -4 -s --max-time 10 https://api.ipify.org || true)
+  [ -n "$id" ] || die "Could not determine server address; pass --server ADDR"
+  echo "$id"
+}
+
+# ---------------------------------------------------------------------------
+# Client payload: the script that runs on the client machine
+# ---------------------------------------------------------------------------
+
+# build_payload <connect_to> <srv_id> <ca_cert> <client_cert> <client_key>
+# connect_to is where the client sends packets (the server, or a relay);
+# srv_id is the identity in the server certificate and never changes.
+# Everything is expanded here on the server, except \$-escaped parts which
+# are evaluated on the client.
+build_payload() {
+  local RIGHT=$1 SRV_ID=$2 CA_CERT=$3 CLIENT_CERT=$4 CLIENT_KEY=$5
+  cat << SCRIPT
+set -e
+# Refuse to run on a box that's actively serving Libreswan VPN
+if pgrep -x pluto >/dev/null; then echo "ABORT: Libreswan (pluto) is running here. Is this a VPN server?"; exit 1; fi
+# Neutralize leftover (stopped) Libreswan so 'ipsec' means strongSwan
+if [ -x /usr/local/sbin/ipsec ] && /usr/local/sbin/ipsec --version 2>/dev/null | grep -qi libreswan; then
+  systemctl disable --now ipsec >/dev/null 2>&1 || true
+  mv /usr/local/sbin/ipsec /usr/local/sbin/ipsec.libreswan
+  echo "Moved leftover Libreswan binary to /usr/local/sbin/ipsec.libreswan"
+fi
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq strongswan strongswan-starter libcharon-extra-plugins iptables iproute2 >/dev/null
+TS=\$(date +%s)
+for f in /etc/ipsec.conf /etc/ipsec.secrets; do [ -f \$f ] && cp -a \$f \$f.bak.\$TS; done
+install -d -m 755 /etc/ipsec.d/cacerts /etc/ipsec.d/certs
+install -d -m 700 /etc/ipsec.d/private
+cat > /etc/ipsec.d/cacerts/$CONN-ca.pem << 'X'
+$CA_CERT
+X
+cat > /etc/ipsec.d/certs/$CONN-client.pem << 'X'
+$CLIENT_CERT
+X
+# Updown hook:
+#  - ip rule: keep Docker/LAN (connected) routes in main table, only default goes to VPN
+#  - SNAT: container traffic uses VPN virtual IP so it matches the IPsec policy
+#  - MSS clamp: avoid MTU blackholes (host + containers)
+cat > /etc/ipsec.d/$CONN-updown.sh << 'X'
+#!/bin/sh
+/usr/lib/ipsec/_updown iptables "\$@"
+NAT="-s 172.16.0.0/12 ! -d 172.16.0.0/12 -m comment --comment $CONN -j SNAT --to-source \$PLUTO_MY_SOURCEIP"
+MSS="-p tcp --tcp-flags SYN,RST SYN -m comment --comment $CONN -j TCPMSS --set-mss 1360"
+case "\$PLUTO_VERB" in
+  up-client)
+    ip rule show | grep -q suppress_prefixlength || ip rule add lookup main suppress_prefixlength 0 priority 200
+    iptables -t nat -C POSTROUTING \$NAT 2>/dev/null || iptables -t nat -I POSTROUTING 1 \$NAT
+    for CH in FORWARD OUTPUT; do
+      iptables -t mangle -C \$CH \$MSS 2>/dev/null || iptables -t mangle -I \$CH 1 \$MSS
+    done ;;
+  down-client)
+    ip rule del lookup main suppress_prefixlength 0 priority 200 2>/dev/null
+    iptables -t nat -D POSTROUTING \$NAT 2>/dev/null
+    for CH in FORWARD OUTPUT; do iptables -t mangle -D \$CH \$MSS 2>/dev/null; done ;;
+esac
+exit 0
+X
+chmod 755 /etc/ipsec.d/$CONN-updown.sh
+umask 077
+cat > /etc/ipsec.d/private/$CONN-client.key << 'X'
+$CLIENT_KEY
+X
+cat > /etc/ipsec.conf << 'X'
+config setup
+    charondebug="ike 1, knl 1, cfg 0"
+conn $CONN
+    keyexchange=ikev2
+    ike=aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048!
+    esp=aes256gcm16,aes128gcm16,aes256-sha256,aes128-sha256,aes256-sha1!
+    left=%defaultroute
+    leftsourceip=%config
+    leftauth=pubkey
+    leftcert=$CONN-client.pem
+    leftupdown=/etc/ipsec.d/$CONN-updown.sh
+    right=$RIGHT
+    rightid=$SRV_ID
+    rightauth=pubkey
+    rightsubnet=0.0.0.0/0
+    dpdaction=restart
+    closeaction=restart
+    keyingtries=%forever
+    auto=start
+X
+echo ': RSA $CONN-client.key' > /etc/ipsec.secrets
+chmod 600 /etc/ipsec.secrets
+systemctl enable strongswan-starter >/dev/null 2>&1 || true
+/usr/sbin/ipsec restart
+sleep 6
+/usr/sbin/ipsec status $CONN
+echo "Routing rule:     \$(ip rule show | grep suppress_prefixlength || echo MISSING)"
+echo "Host IP now:      \$(curl -4 -s --max-time 8 https://api.ipify.org) (expected: $SRV_ID)"
+if command -v docker >/dev/null 2>&1; then
+  echo "Container IP now: \$(timeout 90 docker run --rm curlimages/curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo 'check failed') (expected: $SRV_ID)"
+fi
+echo
+echo "Manage this tunnel:  install swanlink (curl -fsSL $RAW_URL/install.sh | sudo bash)"
+echo "                     then: swanlink up | down | status | remove"
+echo "Without swanlink:    sudo ipsec down $CONN   /   sudo ipsec up $CONN"
+SCRIPT
+}
+
+# make_client_command <name> <connect_to> <srv_id> <use_sudo>
+make_client_command() {
+  local name=$1 connect_to=$2 srv_id=$3 use_sudo=$4
+  local pass ca cert key payload runner
+  mk_tmp
+  pass=$(openssl rand -hex 16)
+  pk12util -d "$DB" -n "$name" -o "$TMP/c.p12" -W "$pass" >/dev/null
+
+  o() {
+    openssl pkcs12 -in "$TMP/c.p12" -passin pass:"$pass" "$@" 2>/dev/null \
+      || openssl pkcs12 -legacy -in "$TMP/c.p12" -passin pass:"$pass" "$@"
+  }
+  cert=$(o -clcerts -nokeys | sed -n '/BEGIN CERT/,/END CERT/p')
+  key=$(o -nocerts -nodes | sed -n '/BEGIN.*PRIVATE KEY/,/END.*PRIVATE KEY/p')
+  ca=$(certutil -L -d "$DB" -n "IKEv2 VPN CA" -a)
+  [ -n "$cert" ] && [ -n "$key" ] && [ -n "$ca" ] || die "Failed to export certificates for '$name'"
+
+  payload=$(build_payload "$connect_to" "$srv_id" "$ca" "$cert" "$key")
+  runner="bash"
+  [ "$use_sudo" = 1 ] && runner="sudo bash"
+  printf 'echo %s | base64 -d | gunzip | %s\n' \
+    "$(printf '%s\n' "$payload" | gzip -9 | base64 -w0)" "$runner"
+}
+
+# ---------------------------------------------------------------------------
+# Clipboard: local tools first, then OSC 52 (works through SSH in most
+# modern terminals: iTerm2, kitty, WezTerm, Windows Terminal, Alacritty, ...)
+# ---------------------------------------------------------------------------
+
+copy_to_clipboard() {
+  local data=$1
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$data" | wl-copy && { echo "wl-copy"; return 0; }
+  fi
+  if [ -n "${DISPLAY:-}" ]; then
+    if command -v xclip >/dev/null 2>&1; then
+      printf '%s' "$data" | xclip -selection clipboard && { echo "xclip"; return 0; }
+    elif command -v xsel >/dev/null 2>&1; then
+      printf '%s' "$data" | xsel --clipboard --input && { echo "xsel"; return 0; }
+    fi
+  fi
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$data" | pbcopy && { echo "pbcopy"; return 0; }
+  fi
+  if { : >/dev/tty; } 2>/dev/null; then
+    local b64 seq
+    b64=$(printf '%s' "$data" | base64 -w0)
+    seq=$(printf '\033]52;c;%s\a' "$b64")
+    # tmux needs passthrough wrapping (requires `set -g allow-passthrough on`)
+    # shellcheck disable=SC1003
+    [ -n "${TMUX:-}" ] && seq=$(printf '\033Ptmux;\033%s\033\\' "$seq")
+    printf '%s' "$seq" >/dev/tty && { echo "osc52"; return 0; }
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Server commands
+# ---------------------------------------------------------------------------
+
+cmd_setup() {
+  local force=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dns)   export VPN_DNS_NAME=${2:?--dns needs a value}; shift ;;
+      --ip)    export VPN_PUBLIC_IP=${2:?--ip needs a value}; shift ;;
+      -f|--force) force=1 ;;
+      -h|--help) usage_setup; return 0 ;;
+      *) die "Unknown option for setup: $1" ;;
+    esac
+    shift
+  done
+  need_root setup
+
+  if is_server && [ $force -eq 0 ]; then
+    ok "IKEv2 VPN server is already set up on this host."
+    hint "Add a client:  sudo swanlink add <name>"
+    hint "Re-run setup:  sudo swanlink setup --force"
+    return 0
+  fi
+  if pgrep -x charon >/dev/null 2>&1 && grep -qs "conn $CONN" /etc/ipsec.conf; then
+    die "This host is a swanlink client (strongSwan). Run 'swanlink remove' first."
+  fi
+
+  mk_tmp
+  info "Downloading VPN installer from $VPNSETUP_URL (hwdsl2/setup-ipsec-vpn)"
+  fetch "$VPNSETUP_URL" "$TMP/vpn.sh"
+  info "Running VPN installer (takes a few minutes)"
+  bash "$TMP/vpn.sh" </dev/null
+  is_server || die "Installer finished but $IKEV2_CONF is missing. Check the output above."
+
+  install -d -m 700 "$STATE_DIR"
+  echo
+  ok "VPN server is ready (server address: $(server_id))"
+  hint "Next: create a client and get its one-line connect command:"
+  hint "  sudo swanlink add <client-name>"
+}
+
+# Parses options shared by add/show. Sets: OPT_SERVER OPT_VIA OPT_OUT OPT_RAW OPT_COPY OPT_SUDO ARG_NAME
+parse_client_opts() {
+  OPT_SERVER="" OPT_VIA="" OPT_OUT="" OPT_RAW=0 OPT_COPY=1 OPT_SUDO=1 ARG_NAME=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --server)  OPT_SERVER=${2:?--server needs a value}; shift ;;
+      --via)     OPT_VIA=${2:?--via needs a relay address}; shift ;;
+      -o|--out)  OPT_OUT=${2:?--out needs a file}; shift ;;
+      --raw)     OPT_RAW=1; OPT_COPY=0 ;;
+      --no-copy) OPT_COPY=0 ;;
+      --no-sudo) OPT_SUDO=0 ;;
+      -h|--help) usage_client; exit 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *) [ -z "$ARG_NAME" ] || die "Unexpected argument: $1"; ARG_NAME=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$ARG_NAME" ] || { usage_client; exit 1; }
+  valid_name "$ARG_NAME"
+}
+
+emit_client_command() {
+  local name=$1 srv target cmd how
+  srv=${OPT_SERVER:-$(server_id)}
+  target=$srv
+  [ -n "$OPT_VIA" ] && target="$OPT_VIA, relay to $srv"
+  cmd=$(make_client_command "$name" "${OPT_VIA:-$srv}" "$srv" "$OPT_SUDO")
+
+  if [ -n "$OPT_OUT" ]; then
+    (umask 077; printf '%s\n' "$cmd" > "$OPT_OUT")
+  fi
+
+  if [ "$OPT_RAW" = 1 ]; then
+    printf '%s\n' "$cmd"
+    return 0
+  fi
+
+  echo >&2
+  printf '%s── Run this on the CLIENT machine (%s → %s) ──%s\n' "$C_BOLD" "$name" "$target" "$C_RESET" >&2
+  echo >&2
+  printf '%s\n' "$cmd"
+  echo >&2
+  printf '%s────────────────────────────────────────────────%s\n' "$C_BOLD" "$C_RESET" >&2
+
+  if [ "$OPT_COPY" = 1 ]; then
+    if how=$(copy_to_clipboard "$cmd"); then
+      if [ "$how" = osc52 ]; then
+        ok "Sent to your clipboard via terminal (OSC 52) — works if your terminal supports it."
+      else
+        ok "Copied to clipboard ($how)."
+      fi
+    else
+      warn "Could not copy to clipboard; copy the line above manually."
+    fi
+  fi
+  [ -n "$OPT_OUT" ] && ok "Saved to $OPT_OUT (mode 600)."
+  warn "This command contains the client's private key. Treat it like a password."
+  hint "One client name per machine: two machines sharing a cert kick each other off."
+}
+
+cmd_add() {
+  parse_client_opts "$@"
+  need_root add
+  require_server
+  local name=$ARG_NAME
+  is_revoked "$name" && die "Client '$name' was revoked. Pick a different name."
+
+  if client_exists "$name"; then
+    warn "Client '$name' already exists; reusing its certificate."
+  else
+    info "Creating client certificate '$name'"
+    "$(ikev2_bin)" --addclient "$name" >/dev/null
+    client_exists "$name" || die "Failed to create client '$name'"
+    ok "Client '$name' created."
+  fi
+  emit_client_command "$name"
+}
+
+cmd_show() {
+  parse_client_opts "$@"
+  need_root show
+  require_server
+  local name=$ARG_NAME
+  client_exists "$name" || die "No client named '$name'. Create it with: sudo swanlink add $name"
+  is_revoked "$name" && die "Client '$name' was revoked."
+  emit_client_command "$name"
+}
+
+cmd_list() {
+  need_root list
+  require_server
+  "$(ikev2_bin)" --listclients
+  if [ -s "$REVOKED_FILE" ]; then
+    echo
+    echo "Revoked via swanlink: $(paste -sd' ' "$REVOKED_FILE")"
+  fi
+}
+
+cmd_revoke() {
+  local yes=0 name=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -y|--yes) yes=1 ;;
+      -*) die "Unknown option: $1" ;;
+      *) name=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "Usage: swanlink revoke <name> [-y]"
+  need_root revoke
+  require_server
+  valid_name "$name"
+  client_exists "$name" || die "No client named '$name'."
+  [ $yes = 1 ] || confirm "Revoke client '$name'? It will no longer be able to connect." || die "Aborted."
+  "$(ikev2_bin)" --revokeclient "$name" -y
+  install -d -m 700 "$STATE_DIR"
+  is_revoked "$name" || echo "$name" >> "$REVOKED_FILE"
+  ok "Client '$name' revoked."
+}
+
+cmd_delete() {
+  local yes=0 name=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -y|--yes) yes=1 ;;
+      -*) die "Unknown option: $1" ;;
+      *) name=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "Usage: swanlink delete <name> [-y]"
+  need_root delete
+  require_server
+  valid_name "$name"
+  client_exists "$name" || die "No client named '$name'."
+  warn "Deleting does not revoke: copies of the cert keep working until it expires."
+  [ $yes = 1 ] || confirm "Delete client '$name'?" || die "Aborted."
+  "$(ikev2_bin)" --deleteclient "$name" -y
+  ok "Client '$name' deleted."
+}
+
+server_status() {
+  local svc
+  printf '%sRole:%s      VPN server (Libreswan + IKEv2)\n' "$C_BOLD" "$C_RESET"
+  printf '%sAddress:%s   %s\n' "$C_BOLD" "$C_RESET" "$(server_id)"
+  for svc in ipsec xl2tpd; do
+    printf '%sService:%s   %-8s %s\n' "$C_BOLD" "$C_RESET" "$svc" "$(systemctl is-active "$svc" 2>/dev/null || true)"
+  done
+  echo
+  printf '%sConnected clients:%s\n' "$C_BOLD" "$C_RESET"
+  ipsec trafficstatus 2>/dev/null || ipsec whack --trafficstatus 2>/dev/null || echo "  (none)"
+}
+
+# ---------------------------------------------------------------------------
+# Client-side commands (run on the machine that connects to the VPN)
+# ---------------------------------------------------------------------------
+
+# Prints the strongSwan connection name configured on this client.
+client_conn() {
+  local c
+  for c in "$CONN" "${LEGACY_CONNS[@]}"; do
+    if grep -qsE "^conn[[:space:]]+$c\$" /etc/ipsec.conf; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_client() {
+  [ -x "$STRONGSWAN_IPSEC" ] || die "strongSwan is not installed. Run the command from 'swanlink add' on the server first."
+  CLIENT_CONN=$(client_conn) || die "No swanlink tunnel configured on this host. Run the command from 'swanlink add' on the server first."
+}
+
+tunnel_up() { "$STRONGSWAN_IPSEC" status "$1" 2>/dev/null | grep -q 'INSTALLED'; }
+
+public_ip() { curl -4 -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "unknown"; }
+
+client_status() {
+  local server right state
+  right=$(grep -m1 -oP '^\s*right=\K\S+' /etc/ipsec.conf || echo "?")
+  server=$(grep -m1 -oP '^\s*rightid=\K\S+' /etc/ipsec.conf || echo "$right")
+  [ "$right" != "$server" ] && server="$server (via relay $right)"
+  if tunnel_up "$CLIENT_CONN"; then
+    state="${C_GREEN}up${C_RESET}"
+  else
+    state="${C_RED}down${C_RESET}"
+  fi
+  printf '%sRole:%s      VPN client (strongSwan, conn "%s")\n' "$C_BOLD" "$C_RESET" "$CLIENT_CONN"
+  printf '%sServer:%s    %s\n' "$C_BOLD" "$C_RESET" "$server"
+  printf '%sTunnel:%s    %s\n' "$C_BOLD" "$C_RESET" "$state"
+  printf '%sAutostart:%s %s\n' "$C_BOLD" "$C_RESET" "$(systemctl is-enabled strongswan-starter 2>/dev/null || echo unknown)"
+  printf '%sPublic IP:%s %s\n' "$C_BOLD" "$C_RESET" "$(public_ip)"
+}
+
+cmd_up() {
+  need_root up
+  require_client
+  systemctl start strongswan-starter
+  sleep 1
+  if tunnel_up "$CLIENT_CONN"; then
+    ok "Tunnel already up."
+  else
+    info "Bringing up tunnel '$CLIENT_CONN'"
+    "$STRONGSWAN_IPSEC" up "$CLIENT_CONN" >/dev/null || true
+    sleep 2
+    tunnel_up "$CLIENT_CONN" || die "Tunnel failed to come up. See: journalctl -u strongswan-starter -n 50"
+    ok "Tunnel up."
+  fi
+  hint "Public IP: $(public_ip)"
+}
+
+cmd_down() {
+  need_root down
+  require_client
+  "$STRONGSWAN_IPSEC" down "$CLIENT_CONN" >/dev/null 2>&1 || true
+  ok "Tunnel down. Traffic now goes out directly."
+  if systemctl is-enabled strongswan-starter >/dev/null 2>&1; then
+    hint "It will reconnect on reboot. Use 'swanlink disable' to stop that."
+  fi
+}
+
+cmd_enable() {
+  need_root enable
+  require_client
+  systemctl enable strongswan-starter >/dev/null 2>&1
+  ok "Tunnel will start automatically on boot."
+}
+
+cmd_disable() {
+  need_root disable
+  require_client
+  systemctl disable strongswan-starter >/dev/null 2>&1
+  ok "Tunnel will no longer start on boot (current state unchanged)."
+}
+
+cmd_remove() {
+  local yes=0
+  case ${1:-} in
+    -y|--yes) yes=1 ;;
+    '') ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  need_root remove
+  pgrep -x pluto >/dev/null 2>&1 && die "Libreswan is running here; this looks like the VPN server. 'remove' is for clients."
+  require_client
+  [ $yes = 1 ] || confirm "Remove the VPN tunnel '$CLIENT_CONN' from this machine?" || die "Aborted."
+
+  "$STRONGSWAN_IPSEC" down "$CLIENT_CONN" >/dev/null 2>&1 || true
+  systemctl disable --now strongswan-starter >/dev/null 2>&1 || true
+  ip rule del lookup main suppress_prefixlength 0 priority 200 2>/dev/null || true
+
+  local c
+  for c in "$CONN" "${LEGACY_CONNS[@]}"; do
+    rm -f "/etc/ipsec.d/cacerts/$c-ca.pem" "/etc/ipsec.d/certs/$c-client.pem" \
+          "/etc/ipsec.d/private/$c-client.key" "/etc/ipsec.d/$c-updown.sh"
+  done
+  printf 'config setup\n' > /etc/ipsec.conf
+  : > /etc/ipsec.secrets
+  ok "Tunnel removed. Traffic now goes out directly."
+  hint "Previous configs were backed up as /etc/ipsec.conf.bak.* and /etc/ipsec.secrets.bak.*"
+  hint "strongSwan packages are still installed: apt-get remove strongswan strongswan-starter"
+}
+
+# ---------------------------------------------------------------------------
+# Relay commands (run on a box that forwards UDP 500/4500 to the VPN server)
+# ---------------------------------------------------------------------------
+
+RELAY_ENV="$STATE_DIR/relay.env"
+RELAY_NGINX_DIR="/etc/nginx/swanlink"
+RELAY_NGINX_INCLUDE="stream { include $RELAY_NGINX_DIR/*.conf; } # swanlink relay"
+RELAY_IPT_SCRIPT="$STATE_DIR/relay-iptables.sh"
+RELAY_UNIT="/etc/systemd/system/swanlink-relay.service"
+
+is_relay() { [ -f "$RELAY_ENV" ]; }
+
+resolve_ipv4() {
+  if [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$1"
+  else
+    getent ahostsv4 "$1" | awk 'NR==1 {print $1}'
+  fi
+}
+
+relay_setup_nginx() {
+  local target=$1
+  if ! command -v nginx >/dev/null 2>&1; then
+    info "Installing nginx"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx libnginx-mod-stream >/dev/null
+  elif ! nginx -V 2>&1 | grep -q -- '--with-stream'; then
+    info "Installing nginx stream module"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnginx-mod-stream >/dev/null \
+      || die "nginx has no stream module; install it or use: swanlink relay $target --iptables"
+  fi
+
+  install -d -m 755 "$RELAY_NGINX_DIR"
+  cat > "$RELAY_NGINX_DIR/relay.conf" << EOF
+# Managed by swanlink: forwards IKEv2 (UDP 500/4500) to the VPN server.
+server {
+    listen 500 udp;
+    proxy_pass $target:500;
+    proxy_timeout 1h;
+}
+server {
+    listen 4500 udp;
+    proxy_pass $target:4500;
+    proxy_timeout 1h;
+}
+EOF
+
+  # nginx allows only one stream {} block. Add ours unless one already exists.
+  if ! grep -qF "$RELAY_NGINX_INCLUDE" /etc/nginx/nginx.conf; then
+    if nginx -T 2>/dev/null | grep -qE '^[[:space:]]*stream[[:space:]]*\{'; then
+      rm -f "$RELAY_NGINX_DIR/relay.conf"
+      die "nginx already has a stream {} block. Add 'include $RELAY_NGINX_DIR/*.conf;' inside it, then re-run."
+    fi
+    printf '\n%s\n' "$RELAY_NGINX_INCLUDE" >> /etc/nginx/nginx.conf
+  fi
+
+  nginx -t 2>/dev/null || { nginx -t; die "nginx config test failed (see above)."; }
+  systemctl enable nginx >/dev/null 2>&1 || true
+  systemctl reload-or-restart nginx
+}
+
+relay_remove_nginx() {
+  rm -rf "$RELAY_NGINX_DIR"
+  if [ -f /etc/nginx/nginx.conf ]; then
+    grep -vF "$RELAY_NGINX_INCLUDE" /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.swanlink-tmp
+    cat /etc/nginx/nginx.conf.swanlink-tmp > /etc/nginx/nginx.conf
+    rm -f /etc/nginx/nginx.conf.swanlink-tmp
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+}
+
+relay_setup_iptables() {
+  local target=$1
+  need_cmd iptables
+  cat > "$RELAY_IPT_SCRIPT" << EOF
+#!/bin/sh
+# Managed by swanlink: forwards IKEv2 (UDP 500/4500) to $target.
+T=$target
+C="-m comment --comment swanlink-relay"
+P="-p udp -m multiport"
+rules() {
+  iptables -t nat \$1 PREROUTING \$P --dports 500,4500 -m addrtype --dst-type LOCAL \$C -j DNAT --to-destination \$T
+  iptables -t nat \$1 POSTROUTING \$P --dports 500,4500 -d \$T \$C -j MASQUERADE
+  iptables \$1 FORWARD \$P --dports 500,4500 -d \$T \$C -j ACCEPT
+  iptables \$1 FORWARD \$P --sports 500,4500 -s \$T \$C -j ACCEPT
+}
+case "\$1" in
+  start) sysctl -qw net.ipv4.ip_forward=1; rules -D 2>/dev/null; rules -I ;;
+  stop)  rules -D 2>/dev/null; true ;;
+esac
+EOF
+  chmod 755 "$RELAY_IPT_SCRIPT"
+
+  cat > "$RELAY_UNIT" << EOF
+[Unit]
+Description=swanlink IKEv2 relay (iptables)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$RELAY_IPT_SCRIPT start
+ExecStop=$RELAY_IPT_SCRIPT stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-swanlink-relay.conf
+  systemctl daemon-reload
+  systemctl enable swanlink-relay >/dev/null 2>&1
+  systemctl restart swanlink-relay
+}
+
+relay_remove_iptables() {
+  systemctl disable --now swanlink-relay >/dev/null 2>&1 || true
+  rm -f "$RELAY_UNIT" "$RELAY_IPT_SCRIPT" /etc/sysctl.d/99-swanlink-relay.conf
+  systemctl daemon-reload
+}
+
+relay_status() {
+  # shellcheck disable=SC1090
+  . "$RELAY_ENV"
+  printf '%sRole:%s      Relay (%s)\n' "$C_BOLD" "$C_RESET" "$RELAY_MODE"
+  printf '%sForwards:%s  UDP 500, 4500 -> %s\n' "$C_BOLD" "$C_RESET" "$RELAY_TARGET"
+  if [ "$RELAY_MODE" = nginx ]; then
+    printf '%sService:%s   nginx %s\n' "$C_BOLD" "$C_RESET" "$(systemctl is-active nginx 2>/dev/null || true)"
+  else
+    printf '%sService:%s   swanlink-relay %s\n' "$C_BOLD" "$C_RESET" "$(systemctl is-active swanlink-relay 2>/dev/null || true)"
+  fi
+  printf '%sListening:%s %s\n' "$C_BOLD" "$C_RESET" \
+    "$(ss -Hlun 2>/dev/null | awk '$4 ~ /:(500|4500)$/ {print $4}' | paste -sd' ' || true)"
+}
+
+relay_remove() {
+  is_relay || die "No swanlink relay on this host."
+  # shellcheck disable=SC1090
+  . "$RELAY_ENV"
+  if [ "$RELAY_MODE" = nginx ]; then relay_remove_nginx; else relay_remove_iptables; fi
+  rm -f "$RELAY_ENV"
+  ok "Relay removed."
+}
+
+cmd_relay() {
+  local mode=nginx target="" ip
+  case ${1:-} in
+    status) need_root relay; is_relay || die "No swanlink relay on this host."; relay_status; return 0 ;;
+    remove) need_root relay; relay_remove; return 0 ;;
+    ''|-h|--help) usage_relay; return 0 ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --nginx)    mode=nginx ;;
+      --iptables) mode=iptables ;;
+      -*) die "Unknown option: $1" ;;
+      *) [ -z "$target" ] || die "Unexpected argument: $1"; target=$1 ;;
+    esac
+    shift
+  done
+  need_root relay
+  is_server && die "This host is the VPN server; a relay must be a different machine."
+  client_conn >/dev/null && die "This host is a VPN client; a relay must be a different machine."
+
+  ip=$(resolve_ipv4 "$target")
+  [ -n "$ip" ] || die "Could not resolve '$target' to an IPv4 address."
+
+  if is_relay; then
+    info "Replacing existing relay config"
+    relay_remove >/dev/null 2>&1
+  fi
+
+  info "Setting up $mode relay: UDP 500, 4500 -> $ip"
+  if [ "$mode" = nginx ]; then relay_setup_nginx "$ip"; else relay_setup_iptables "$ip"; fi
+
+  install -d -m 700 "$STATE_DIR"
+  printf 'RELAY_MODE=%s\nRELAY_TARGET=%s\n' "$mode" "$ip" > "$RELAY_ENV"
+  ok "Relay is up: this host forwards IKEv2 to $ip."
+  hint "Open UDP 500 and 4500 on this host's firewall."
+  hint "On the VPN server, create clients that connect through this relay:"
+  hint "  sudo swanlink add <name> --via $(curl -4 -s --max-time 8 https://api.ipify.org 2>/dev/null || echo THIS_HOST_IP)"
+}
+
+# ---------------------------------------------------------------------------
+# Shared commands
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+  need_root status
+  if is_server; then
+    server_status
+  elif is_relay; then
+    relay_status
+  elif CLIENT_CONN=$(client_conn); then
+    client_status
+  else
+    echo "Nothing set up on this host yet."
+    hint "VPN server:  sudo swanlink setup"
+    hint "VPN client:  run the command printed by 'swanlink add <name>' on your server"
+    hint "Relay:       sudo swanlink relay <vpn-server-ip>"
+  fi
+}
+
+self_path() { readlink -f "${BASH_SOURCE[0]}"; }
+
+cmd_update() {
+  need_root update
+  local self new_ver
+  self=$(self_path)
+  mk_tmp
+  info "Downloading latest swanlink from $RAW_URL"
+  fetch "$RAW_URL/swanlink" "$TMP/swanlink"
+  bash -n "$TMP/swanlink" || die "Downloaded file is not valid bash; aborting."
+  new_ver=$(grep -m1 -oP '^VERSION="\K[^"]+' "$TMP/swanlink" || echo "?")
+  install -m 755 "$TMP/swanlink" "$self"
+  ok "Updated $self: $VERSION -> $new_ver"
+}
+
+cmd_uninstall() {
+  local vpn=0 yes=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --vpn) vpn=1 ;;
+      -y|--yes) yes=1 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+    shift
+  done
+  need_root uninstall
+
+  if [ $vpn = 1 ]; then
+    is_server || die "No VPN server installed here."
+    warn "This removes the VPN server, ALL client certificates and the CA. Clients stop working."
+    [ $yes = 1 ] || confirm "Uninstall the VPN server?" || die "Aborted."
+    mk_tmp
+    fetch "$VPNUNINSTALL_URL" "$TMP/unst.sh"
+    bash "$TMP/unst.sh" </dev/null
+    rm -rf "$STATE_DIR"
+  fi
+  rm -f "$(self_path)"
+  ok "swanlink removed."
+}
+
+# ---------------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------------
+
+banner() {
+  printf '%s' "$C_CYAN" >&2
+  cat >&2 << 'B'
+                          _ _       _
+  _____      ____ _ _ __ | (_)_ __ | | __
+ / __\ \ /\ / / _` | '_ \| | | '_ \| |/ /
+ \__ \\ V  V / (_| | | | | | | | | |   <
+ |___/ \_/\_/ \__,_|_| |_|_|_|_| |_|_|\_\
+B
+  printf '%s  v%s — IKEv2 VPN server & client manager\n\n' "$C_RESET" "$VERSION" >&2
+}
+
+ask_name() {
+  local n
+  read -rp "Client name: " n
+  printf '%s' "$n"
+}
+
+ask_relay_target() {
+  local t
+  read -rp "VPN server IP or hostname: " t
+  printf '%s' "$t"
+}
+
+run() { ( "$@" ) || true; echo; read -rp "Press Enter to continue..." _; }
+
+cmd_menu() {
+  if [ ! -t 0 ]; then usage; return 0; fi
+  need_root
+  local choice
+  while true; do
+    clear 2>/dev/null || true
+    banner
+    if is_server; then
+      cat >&2 << 'M'
+  Server
+   1) Add client         (create + print connect command)
+   2) Show client command
+   3) List clients
+   4) Revoke client
+   5) Status
+M
+    elif client_conn >/dev/null; then
+      cat >&2 << 'M'
+  Client
+   1) Tunnel up
+   2) Tunnel down
+   3) Status
+   4) Remove tunnel
+M
+    elif is_relay; then
+      cat >&2 << 'M'
+  Relay
+   1) Status
+   2) Remove relay
+M
+    else
+      cat >&2 << 'M'
+   1) Set up this machine as a VPN server
+   2) Set up this machine as a relay
+M
+    fi
+    cat >&2 << 'M'
+   u) Update swanlink
+   q) Quit
+M
+    echo >&2
+    read -rp "Choose: " choice || return 0
+    if is_server; then
+      case $choice in
+        1) run cmd_add "$(ask_name)" ;;
+        2) run cmd_show "$(ask_name)" ;;
+        3) run cmd_list ;;
+        4) run cmd_revoke "$(ask_name)" ;;
+        5) run cmd_status ;;
+        u) run cmd_update ;;
+        q|Q|'') return 0 ;;
+      esac
+    elif client_conn >/dev/null; then
+      case $choice in
+        1) run cmd_up ;;
+        2) run cmd_down ;;
+        3) run cmd_status ;;
+        4) run cmd_remove ;;
+        u) run cmd_update ;;
+        q|Q|'') return 0 ;;
+      esac
+    elif is_relay; then
+      case $choice in
+        1) run cmd_status ;;
+        2) run cmd_relay remove ;;
+        u) run cmd_update ;;
+        q|Q|'') return 0 ;;
+      esac
+    else
+      case $choice in
+        1) run cmd_setup ;;
+        2) run cmd_relay "$(ask_relay_target)" ;;
+        u) run cmd_update ;;
+        q|Q|'') return 0 ;;
+      esac
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat << EOF
+swanlink $VERSION — IKEv2 VPN server & one-line client provisioning
+
+Usage: swanlink <command> [options]
+
+Server commands (run on the VPN server):
+  setup [--dns NAME] [--ip ADDR] [--force]
+                       Install the IKEv2 VPN server
+  add <name> [opts]    Create a client and print its one-line connect command
+  show <name> [opts]   Print the connect command for an existing client again
+  list                 List client certificates
+  revoke <name> [-y]   Revoke a client (it can no longer connect)
+  delete <name> [-y]   Delete a client certificate (does not revoke)
+
+Client commands (run on a machine connected with a swanlink command):
+  up                   Bring the tunnel up
+  down                 Bring the tunnel down (traffic goes out directly)
+  enable | disable     Turn autostart on boot on / off
+  remove [-y]          Remove the tunnel config from this machine
+
+Relay commands (run on a separate box that forwards to the VPN server):
+  relay <vpn-server> [--iptables]
+                       Forward UDP 500/4500 to the VPN server (nginx by default)
+  relay status         Show relay status
+  relay remove         Remove the relay
+
+Both:
+  status               Show server or client status (auto-detected)
+  update               Update swanlink to the latest version
+  uninstall [--vpn]    Remove swanlink (--vpn also removes the VPN server)
+  menu                 Interactive menu (default when run with no command)
+  version | help
+
+Options for add/show:
+  --server ADDR        Server identity/address (default: server's IKEv2 ID)
+  --via RELAY          Connect through a relay at RELAY instead of directly
+  -o, --out FILE       Also save the command to FILE (mode 600)
+  --raw                Print only the command (no colors, no clipboard)
+  --no-copy            Do not copy to clipboard
+  --no-sudo            Generate '... | bash' instead of '... | sudo bash'
+
+Examples:
+  sudo swanlink setup
+  sudo swanlink add office-box
+  sudo swanlink show office-box --raw > office-box.cmd
+  sudo swanlink relay 203.0.113.10          # on the relay box
+  sudo swanlink add office-box --via 198.51.100.7
+  sudo swanlink down
+EOF
+}
+
+usage_setup() {
+  cat << 'EOF'
+Usage: swanlink setup [--dns NAME] [--ip ADDR] [--force]
+
+Installs an IPsec/IKEv2 VPN server using hwdsl2/setup-ipsec-vpn.
+
+  --dns NAME   Use a DNS name as the server address (VPN_DNS_NAME)
+  --ip ADDR    Override the detected public IP (VPN_PUBLIC_IP)
+  --force      Run the installer even if a server is already set up
+
+Any VPN_* environment variable understood by setup-ipsec-vpn is passed through.
+EOF
+}
+
+usage_relay() {
+  cat << 'EOF'
+Usage: swanlink relay <vpn-server> [--nginx|--iptables]
+       swanlink relay status | remove
+
+Turns this machine into a relay: incoming IKEv2 (UDP 500 and 4500) is
+forwarded to the VPN server. Then create clients with --via <this-host-ip>.
+
+  --nginx      Use nginx stream proxy (default; installs nginx if missing)
+  --iptables   Use kernel DNAT instead (lighter; no nginx needed)
+EOF
+}
+
+usage_client() {
+  cat << 'EOF'
+Usage: swanlink add|show <name> [--server ADDR] [--via RELAY] [-o FILE] [--raw] [--no-copy] [--no-sudo]
+
+Use a unique name per client machine.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=${1:-menu}
+  [ $# -gt 0 ] && shift
+  case $cmd in
+    setup|install)        cmd_setup "$@" ;;
+    add|new)              cmd_add "$@" ;;
+    show|get)             cmd_show "$@" ;;
+    list|ls)              cmd_list ;;
+    revoke)               cmd_revoke "$@" ;;
+    delete|rm)            cmd_delete "$@" ;;
+    up|connect)           cmd_up ;;
+    down|disconnect)      cmd_down ;;
+    enable)               cmd_enable ;;
+    disable)              cmd_disable ;;
+    remove)               cmd_remove "$@" ;;
+    relay)                cmd_relay "$@" ;;
+    status)               cmd_status ;;
+    update|self-update)   cmd_update ;;
+    uninstall)            cmd_uninstall "$@" ;;
+    menu)                 cmd_menu ;;
+    version|-v|--version) echo "swanlink $VERSION" ;;
+    help|-h|--help)       usage ;;
+    *) usage >&2; die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

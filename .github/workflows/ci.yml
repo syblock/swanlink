@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n swanlink && bash -n install.sh
+      - name: ShellCheck
+        run: shellcheck swanlink install.sh
+      - name: Smoke test
+        run: |
+          ./swanlink version
+          ./swanlink help >/dev/null
