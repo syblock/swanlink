@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1 — 2026-10-23
+
+- Fix shellcheck SC2015 warnings that failed CI: the certificate export check and the nginx reload during relay removal now use explicit `if` blocks. No behavior change.
+
 ## 1.0.0 — 2026-10-23
 
 First release.
