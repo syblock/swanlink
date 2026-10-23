@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — 2026-10-24
+
+- Fix `relay --iptables` failing with "relay-iptables.sh: No such file or directory" on a host where `/etc/swanlink` didn't exist yet.
+- Fix `install.sh` ending with "tmp: unbound variable" after a successful install.
+
 ## 1.1.0 — 2026-10-24
 
 - A swanlink client can now also be a relay. `relay` switches to `--iptables` on a client, because strongSwan holds UDP 500/4500. The relay keeps forwarding while the local tunnel is down.

@@ -24,7 +24,9 @@ main() {
   local prefix=${SWANLINK_PREFIX:-/usr/local/bin}
   local url="https://raw.githubusercontent.com/${repo}/${branch}/swanlink"
   local dest="$prefix/swanlink"
-  local src_dir="" tmp
+  local src_dir=""
+  # Not local: the EXIT trap runs after main() returns.
+  tmp=""
 
   if [ "$(id -u)" -ne 0 ]; then
     echo "swanlink installer must run as root. Use: curl -fsSL <url>/install.sh | sudo bash" >&2
@@ -56,6 +58,7 @@ main() {
   bash -n "$tmp" || { echo "Downloaded swanlink is not a valid bash script." >&2; exit 1; }
   install -d "$prefix"
   install -m 755 "$tmp" "$dest"
+  rm -f "$tmp"
   echo " ✓  Installed $("$dest" version) to $dest" >&2
 
   if [ $# -eq 0 ]; then

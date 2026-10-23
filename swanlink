@@ -13,7 +13,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 REPO="${SWANLINK_REPO:-syblock/swanlink}"
 BRANCH="${SWANLINK_BRANCH:-main}"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
@@ -783,9 +783,9 @@ cmd_relay() {
   fi
 
   info "Setting up $mode relay: UDP 500, 4500 -> $ip"
+  install -d -m 700 "$STATE_DIR"
   if [ "$mode" = nginx ]; then relay_setup_nginx "$ip"; else relay_setup_iptables "$ip"; fi
 
-  install -d -m 700 "$STATE_DIR"
   printf 'RELAY_MODE=%s\nRELAY_TARGET=%s\n' "$mode" "$ip" > "$RELAY_ENV"
   ok "Relay is up: this host forwards IKEv2 to $ip."
   hint "Open UDP 500 and 4500 on this host's firewall."
